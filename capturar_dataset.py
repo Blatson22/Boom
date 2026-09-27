@@ -1,3 +1,5 @@
+import os
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -39,6 +41,14 @@ def main():
     muestras = []
     contador = {"puno": 0, "pinza": 0, "mano_abierta": 0}
     ventana = "Captura de dataset"
+
+    if os.path.exists(RUTA_DATASET):
+        datos = np.load(RUTA_DATASET, allow_pickle=True)
+        if "X" in datos and "y" in datos:
+            for vector, etiqueta in zip(np.asarray(datos["X"]), np.asarray(datos["y"])):
+                etiqueta = str(etiqueta)
+                muestras.append((list(vector), etiqueta))
+                contador[etiqueta] = contador.get(etiqueta, 0) + 1
 
     cv2.namedWindow(ventana)
 

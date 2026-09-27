@@ -72,6 +72,7 @@ def obtener_landmarks(captura, detector):
         return None
     return resultado.hand_landmarks[0]
 
+
 def centro_palma(landmarks):
     x = sum(p.x for p in landmarks) / len(landmarks)
     y = sum(p.y for p in landmarks) / len(landmarks)

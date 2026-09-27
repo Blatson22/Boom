@@ -4,14 +4,13 @@ import random
 import threading
 import time
 from collections import Counter, deque
+from dataclasses import dataclass
 
 import numpy as np
 import pyray as rl
 
 from contratos import EstadoMano
 from detectar_mano import (
-    UMBRAL_EXTENDIDO,
-    UMBRAL_PELLIZCO,
     crear_detector,
     diagnostico_gesto,
     iniciar_captura,
@@ -20,28 +19,59 @@ from detectar_mano import (
     obtener_landmarks,
 )
 
-K_RESORTE = 40.0
-AMORTIGUACION = 8.0
-
 TAMANO_BUFFER_GESTOS = 5
 UMBRAL_MAYORIA = 3
 FPS_DETECCION = 30
 
 RUTA_CORRECCIONES = "correcciones.npz"
 
-N_CUBOS = 8
-RESTITUCION = 0.5
-RADIO_INFLUENCIA = 2.0
-K_RESORTE_SUAVE = 6.0
-UMBRAL_IMPACTO = 4.0
-PARTICULAS_MIN = 8
-PARTICULAS_MAX = 16
-MAX_PARTICULAS = 300
-RADIO_PARTICULA = 0.08
-VELOCIDAD_COLOR = 5.0
-COLOR_LENTO = rl.SKYBLUE
-COLOR_RAPIDO = rl.RED
-COLOR_PARTICULA = rl.ORANGE
+AREA_X_MIN = -4.0
+AREA_X_MAX = 4.0
+AREA_Y_MIN = 0.8
+AREA_Y_MAX = 3.2
+AREA_Z_MIN = -4.0
+AREA_Z_MAX = 4.0
+VELOCIDAD_CUBO_MIN = 1.0
+VELOCIDAD_CUBO_MAX = 2.2
+VELOCIDAD_RAPIDO_MIN = 1.8
+VELOCIDAD_RAPIDO_MAX = 2.8
+VELOCIDAD_TANQUE_MIN = 0.6
+VELOCIDAD_TANQUE_MAX = 1.0
+UMBRAL_WAYPOINT = 0.3
+
+COLOR_NORMAL = rl.SKYBLUE
+COLOR_RAPIDO = rl.YELLOW
+COLOR_TANQUE = rl.BLUE
+MAX_CUBOS = 12
+MAX_FRAGMENTOS = 300
+RADIO_EXPLOSION = 3.0
+RADIO_CADENA = 2.5
+SHAKE_DURACION = 0.35
+SHAKE_MAGNITUD = 0.4
+VOLUMEN_EXPLOSION = 0.8
+VOLUMEN_POP = 0.5
+VIDA_FRAGMENTO = 1.2
+COOLDOWN_ACCION = 0.35
+FLASH_DURACION = 0.25
+
+TAMANO_RAPIDO = 0.5
+TAMANO_TANQUE = 1.4
+VIDA_TANQUE = 2
+TOPE_ESCALA_VELOCIDAD = 2.2
+
+PUNTOS_NORMAL = 10
+PUNTOS_RAPIDO = 25
+PUNTOS_TANQUE = 50
+
+TIEMPO_OLEADA_BASE = 12.0
+TIEMPO_EXTRA_POR_OLEADA = 1.5
+TIEMPO_TRANSICION = 1.0
+VENTANA_COMBO = 1.5
+COMBO_MAX = 5
+
+ESTADO_INICIO = "inicio"
+ESTADO_JUGANDO = "jugando"
+ESTADO_GAME_OVER = "game_over"
 
 
 def gesto_mayoritario(historial, gesto_previo, umbral):
@@ -56,21 +86,63 @@ def presencia_mayoritaria(historial, umbral):
     return sum(historial) >= umbral
 
 
+def objetivo_aleatorio():
+    return rl.Vector3(
+        random.uniform(AREA_X_MIN, AREA_X_MAX),
+        random.uniform(AREA_Y_MIN, AREA_Y_MAX),
+        random.uniform(AREA_Z_MIN, AREA_Z_MAX),
+    )
+
+
+def puntuacion_por_tipo(tipo):
+    if tipo == "rapido":
+        return PUNTOS_RAPIDO
+    if tipo == "tanque":
+        return PUNTOS_TANQUE
+    return PUNTOS_NORMAL
+
+
+def numero_cubos_oleada(oleada):
+    return min(4 + 3 * (oleada - 1), MAX_CUBOS)
+
+
+def duracion_oleada(oleada):
+    return TIEMPO_OLEADA_BASE + TIEMPO_EXTRA_POR_OLEADA * (oleada - 1)
+
+
+def escala_velocidad_oleada(oleada):
+    return min(1.0 + 0.12 * (oleada - 1), TOPE_ESCALA_VELOCIDAD)
+
+
+def elegir_tipo_cubo(oleada):
+    tipos = ["normal", "normal", "normal"]
+    if oleada >= 1:
+        tipos.append("rapido")
+    if oleada >= 2:
+        tipos.append("tanque")
+    return random.choice(tipos)
+
+
 class Cubo:
-    def __init__(self, posicion, tamano, color):
+    def __init__(self, posicion, tamano, color, tipo="normal", vida=1, velocidad_max=None):
         self.posicion = posicion
         self.velocidad = rl.Vector3(0.0, 0.0, 0.0)
         self.tamano = tamano
         self.tamano_base = tamano
         self.color = color
-
-
-class Particula:
-    def __init__(self, posicion, velocidad, vida):
-        self.posicion = posicion
-        self.velocidad = velocidad
+        self.tipo = tipo
         self.vida = vida
-        self.vida_inicial = vida
+        self.flash = 0.0
+        self.velocidad_max = velocidad_max if velocidad_max is not None else random.uniform(VELOCIDAD_CUBO_MIN, VELOCIDAD_CUBO_MAX)
+        self.objetivo_movimiento = objetivo_aleatorio()
+
+
+@dataclass
+class Fragmento:
+    posicion: rl.Vector3
+    velocidad: rl.Vector3
+    vida: float
+    color: rl.Color
 
 
 def distancia_v3(a, b):
@@ -80,21 +152,110 @@ def distancia_v3(a, b):
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
-def generar_particulas(posicion, particulas):
-    if len(particulas) >= MAX_PARTICULAS:
-        return
-    cantidad = random.randint(PARTICULAS_MIN, PARTICULAS_MAX)
-    for _ in range(cantidad):
-        if len(particulas) >= MAX_PARTICULAS:
-            break
-        origen = rl.Vector3(posicion.x, RADIO_PARTICULA, posicion.z)
+def explotar_cubo(posicion_origen, n_fragmentos=12):
+    fragmentos = []
+    for _ in range(n_fragmentos):
+        theta = random.uniform(0.0, 2.0 * math.pi)
+        phi = random.uniform(0.0, math.pi)
+        radio = random.uniform(1.5, 4.5)
         velocidad = rl.Vector3(
-            random.uniform(-2.5, 2.5),
-            random.uniform(1.0, 4.5),
-            random.uniform(-2.5, 2.5),
+            radio * math.sin(phi) * math.cos(theta),
+            radio * math.cos(phi) + 2.0,
+            radio * math.sin(phi) * math.sin(theta),
         )
-        particula = Particula(origen, velocidad, random.uniform(0.4, 0.9))
-        particulas.append(particula)
+        color = rl.color_from_hsv(random.uniform(0.0, 60.0), 0.8, 1.0)
+        fragmento = Fragmento(
+            rl.Vector3(posicion_origen.x, posicion_origen.y, posicion_origen.z),
+            velocidad,
+            random.uniform(0.9, VIDA_FRAGMENTO),
+            color,
+        )
+        fragmentos.append(fragmento)
+    return fragmentos
+
+
+def actualizar_fragmentos(fragmentos, dt):
+    for fragmento in fragmentos:
+        fragmento.velocidad.y -= 9.8 * dt
+        fragmento.posicion.x += fragmento.velocidad.x * dt
+        fragmento.posicion.y += fragmento.velocidad.y * dt
+        fragmento.posicion.z += fragmento.velocidad.z * dt
+        fragmento.vida -= dt
+    return [f for f in fragmentos if f.vida > 0.0 and f.posicion.y > -1.0]
+
+
+def crear_cubo_de_tipo(tipo, oleada):
+    escala = escala_velocidad_oleada(oleada)
+    if tipo == "rapido":
+        tamano = TAMANO_RAPIDO
+        color = COLOR_RAPIDO
+        velocidad_max = random.uniform(VELOCIDAD_RAPIDO_MIN, VELOCIDAD_RAPIDO_MAX) * escala
+        vida = 1
+    elif tipo == "tanque":
+        tamano = TAMANO_TANQUE
+        color = COLOR_TANQUE
+        velocidad_max = random.uniform(VELOCIDAD_TANQUE_MIN, VELOCIDAD_TANQUE_MAX) * escala
+        vida = VIDA_TANQUE
+    else:
+        tamano = random.uniform(0.6, 1.2)
+        color = COLOR_NORMAL
+        velocidad_max = random.uniform(VELOCIDAD_CUBO_MIN, VELOCIDAD_CUBO_MAX) * escala
+        vida = 1
+    posicion = rl.Vector3(
+        random.uniform(AREA_X_MIN, AREA_X_MAX),
+        random.uniform(1.0, 5.0) + 0.5 * tamano,
+        random.uniform(AREA_Z_MIN, AREA_Z_MAX),
+    )
+    return Cubo(posicion, tamano, color, tipo, vida, velocidad_max)
+
+
+def crear_oleada(oleada):
+    cubos = []
+    for _ in range(numero_cubos_oleada(oleada)):
+        cubos.append(crear_cubo_de_tipo(elegir_tipo_cubo(oleada), oleada))
+    return cubos
+
+
+def explotar_cubo_de_lista(cubos, cubo, fragmentos):
+    cubos.remove(cubo)
+    nuevos = explotar_cubo(cubo.posicion)
+    hueco = MAX_FRAGMENTOS - len(fragmentos)
+    if hueco > 0:
+        fragmentos.extend(nuevos[:hueco])
+    return cubo.posicion
+
+
+def intentar_explotar(cubos, posicion, fragmentos):
+    cubos_en_rango = [c for c in cubos if distancia_v3(c.posicion, posicion) <= RADIO_EXPLOSION]
+    if not cubos_en_rango:
+        return 0, False, 0
+    cubo = min(cubos_en_rango, key=lambda c: distancia_v3(c.posicion, posicion))
+    pendientes = [cubo]
+    destruidos = 0
+    impacto_sin_destruir = False
+    puntos_base = 0
+    while pendientes:
+        objetivo_cadena = pendientes.pop()
+        if objetivo_cadena not in cubos:
+            continue
+        if objetivo_cadena.tipo == "tanque" and objetivo_cadena.vida > 1:
+            objetivo_cadena.vida -= 1
+            objetivo_cadena.flash = FLASH_DURACION
+            impacto_sin_destruir = True
+            continue
+        posicion_explosiva = explotar_cubo_de_lista(cubos, objetivo_cadena, fragmentos)
+        destruidos += 1
+        puntos_base += puntuacion_por_tipo(objetivo_cadena.tipo)
+        for vecino in list(cubos):
+            if distancia_v3(vecino.posicion, posicion_explosiva) <= RADIO_CADENA:
+                pendientes.append(vecino)
+    return destruidos, impacto_sin_destruir, puntos_base
+
+
+def dibujar_centrado(texto, y, tamano, color):
+    ancho = rl.measure_text(texto, tamano)
+    x = int((rl.get_screen_width() - ancho) / 2)
+    rl.draw_text(texto, x, y, tamano, color)
 
 
 class HandTracker:
@@ -152,6 +313,21 @@ def main():
     rl.init_window(800, 600, "Simulacion 3D")
     rl.set_target_fps(60)
 
+    audio_inicializado = False
+    sonido_explosion = None
+    sonido_pop = None
+    try:
+        rl.init_audio_device()
+        audio_inicializado = True
+        sonido_explosion = rl.load_sound("explosion.wav")
+        sonido_pop = rl.load_sound("pop.wav")
+        rl.set_sound_volume(sonido_explosion, VOLUMEN_EXPLOSION)
+        rl.set_sound_volume(sonido_pop, VOLUMEN_POP)
+    except Exception:
+        audio_inicializado = False
+        sonido_explosion = None
+        sonido_pop = None
+
     camara = rl.Camera3D(
         rl.Vector3(0.0, 6.0, 12.0),
         rl.Vector3(0.0, 2.0, 0.0),
@@ -164,29 +340,34 @@ def main():
 
     correcciones = []
 
-    gravedad = rl.Vector3(0.0, -9.8, 0.0)
     dt = 1.0 / 60.0
 
     cubos = []
-    for _ in range(N_CUBOS):
-        tamano = random.uniform(0.6, 1.2)
-        posicion = rl.Vector3(
-            random.uniform(-4.0, 4.0),
-            random.uniform(1.0, 5.0) + 0.5 * tamano,
-            random.uniform(-4.0, 4.0),
-        )
-        cubos.append(Cubo(posicion, tamano, COLOR_LENTO))
+    fragmentos = []
+    mostrar_hud = True
+    shake = 0.0
 
-    particulas = []
+    estado_juego = ESTADO_INICIO
+    oleada = 1
+    score = 0
+    combo_multiplicador = 1
+    tiempo_ultimo_combo = 0.0
+    temporizador_oleada = duracion_oleada(oleada)
+    tiempo_transicion = 0.0
 
     historial_gestos = deque(maxlen=TAMANO_BUFFER_GESTOS)
     historial_presencia = deque(maxlen=TAMANO_BUFFER_GESTOS)
     gesto_efectivo = "indefinido"
+    gesto_efectivo_previo = "indefinido"
     objetivo_estable = None
     hay_mano = False
+    tiempo_ultima_accion = 0.0
 
     while not rl.window_should_close():
         estado = tracker.estado_actual()
+
+        if rl.is_key_pressed(rl.KEY_M):
+            mostrar_hud = not mostrar_hud
 
         etiqueta_correccion = None
         if rl.is_key_pressed(rl.KEY_ONE):
@@ -209,105 +390,175 @@ def main():
         if estado is not None:
             objetivo_estable = estado.posicion
 
+        ahora = time.monotonic()
+        gesto_nuevo = gesto_efectivo != gesto_efectivo_previo
+
+        if estado_juego == ESTADO_INICIO:
+            if gesto_efectivo == "pinza" and gesto_nuevo:
+                oleada = 1
+                score = 0
+                combo_multiplicador = 1
+                tiempo_ultimo_combo = 0.0
+                temporizador_oleada = duracion_oleada(oleada)
+                tiempo_transicion = 0.0
+                cubos = crear_oleada(oleada)
+                fragmentos.clear()
+                estado_juego = ESTADO_JUGANDO
+
+        elif estado_juego == ESTADO_JUGANDO:
+            if tiempo_transicion > 0.0:
+                tiempo_transicion -= dt
+                if tiempo_transicion <= 0.0:
+                    oleada += 1
+                    cubos = crear_oleada(oleada)
+                    temporizador_oleada = duracion_oleada(oleada)
+                    tiempo_transicion = 0.0
+            else:
+                temporizador_oleada -= dt
+                if temporizador_oleada <= 0.0:
+                    if cubos:
+                        estado_juego = ESTADO_GAME_OVER
+                        combo_multiplicador = 1
+                else:
+                    if (ahora - tiempo_ultima_accion) >= COOLDOWN_ACCION:
+                        if gesto_efectivo == "puno" and gesto_nuevo and objetivo_estable is not None:
+                            destruidos, impacto, puntos_base = intentar_explotar(cubos, objetivo_estable, fragmentos)
+                            if destruidos > 0 or impacto:
+                                tiempo_ultima_accion = ahora
+                                if destruidos > 0:
+                                    shake = SHAKE_DURACION
+                                    if sonido_explosion is not None:
+                                        rl.play_sound(sonido_explosion)
+                                    if ahora - tiempo_ultimo_combo <= VENTANA_COMBO:
+                                        combo_multiplicador = min(COMBO_MAX, combo_multiplicador + 1)
+                                    else:
+                                        combo_multiplicador = 1
+                                    tiempo_ultimo_combo = ahora
+                                    score += puntos_base * combo_multiplicador
+                                    if not cubos:
+                                        tiempo_transicion = TIEMPO_TRANSICION
+                                else:
+                                    shake = SHAKE_DURACION * 0.5
+                                    if sonido_pop is not None:
+                                        rl.play_sound(sonido_pop)
+                                    combo_multiplicador = 1
+
+        elif estado_juego == ESTADO_GAME_OVER:
+            if gesto_efectivo == "pinza" and gesto_nuevo:
+                oleada = 1
+                score = 0
+                combo_multiplicador = 1
+                tiempo_ultimo_combo = 0.0
+                temporizador_oleada = duracion_oleada(oleada)
+                tiempo_transicion = 0.0
+                cubos = crear_oleada(oleada)
+                fragmentos.clear()
+                estado_juego = ESTADO_JUGANDO
+
+        gesto_efectivo_previo = gesto_efectivo
+
         objetivo = objetivo_estable if (hay_mano and objetivo_estable is not None) else None
         cubo_cercano = None
-        if objetivo is not None and cubos:
+        if estado_juego == ESTADO_JUGANDO and objetivo is not None and cubos:
             cubo_cercano = min(cubos, key=lambda c: distancia_v3(c.posicion, objetivo))
 
-        if hay_mano and cubo_cercano is not None:
-            if gesto_efectivo == "pinza":
-                cubo_cercano.tamano = max(0.3, min(2.5, cubo_cercano.tamano + 0.5 * dt))
-            elif gesto_efectivo == "mano_abierta":
-                cubo_cercano.tamano += (cubo_cercano.tamano_base - cubo_cercano.tamano) * 2.0 * dt
-
         for cubo in cubos:
-            agarrado = hay_mano and objetivo is not None and cubo is cubo_cercano and gesto_efectivo == "puno"
+            if cubo.flash > 0.0:
+                cubo.flash -= dt
+                if cubo.flash < 0.0:
+                    cubo.flash = 0.0
+            if estado_juego != ESTADO_JUGANDO:
+                continue
+
+            agarrado = hay_mano and objetivo is not None and cubo is cubo_cercano and gesto_efectivo == "mano_abierta"
             if agarrado:
                 cubo.posicion = rl.Vector3(objetivo.x, objetivo.y, objetivo.z)
                 cubo.velocidad = rl.Vector3(0.0, 0.0, 0.0)
                 continue
 
-            ax = 0.0
-            ay = gravedad.y
-            az = 0.0
+            dx = cubo.objetivo_movimiento.x - cubo.posicion.x
+            dy = cubo.objetivo_movimiento.y - cubo.posicion.y
+            dz = cubo.objetivo_movimiento.z - cubo.posicion.z
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist < UMBRAL_WAYPOINT:
+                cubo.objetivo_movimiento = objetivo_aleatorio()
+            else:
+                cubo.velocidad = rl.Vector3(
+                    dx / dist * cubo.velocidad_max,
+                    dy / dist * cubo.velocidad_max,
+                    dz / dist * cubo.velocidad_max,
+                )
+                cubo.posicion.x += cubo.velocidad.x * dt
+                cubo.posicion.y += cubo.velocidad.y * dt
+                cubo.posicion.z += cubo.velocidad.z * dt
 
-            if hay_mano and objetivo is not None:
-                dx = objetivo.x - cubo.posicion.x
-                dy = objetivo.y - cubo.posicion.y
-                dz = objetivo.z - cubo.posicion.z
-                dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-                rigidez = 0.0
-                if cubo is cubo_cercano:
-                    rigidez = K_RESORTE
-                elif dist < RADIO_INFLUENCIA:
-                    rigidez = K_RESORTE_SUAVE
-                if rigidez > 0.0 and dist > 0.0001:
-                    ax += dx * rigidez - cubo.velocidad.x * AMORTIGUACION
-                    ay += dy * rigidez - cubo.velocidad.y * AMORTIGUACION
-                    az += dz * rigidez - cubo.velocidad.z * AMORTIGUACION
+            cubo.posicion.x = max(AREA_X_MIN, min(AREA_X_MAX, cubo.posicion.x))
+            cubo.posicion.y = max(AREA_Y_MIN, min(AREA_Y_MAX, cubo.posicion.y))
+            cubo.posicion.z = max(AREA_Z_MIN, min(AREA_Z_MAX, cubo.posicion.z))
 
-            cubo.velocidad.x += ax * dt
-            cubo.velocidad.y += ay * dt
-            cubo.velocidad.z += az * dt
-
-            cubo.posicion.x += cubo.velocidad.x * dt
-            cubo.posicion.y += cubo.velocidad.y * dt
-            cubo.posicion.z += cubo.velocidad.z * dt
-
-            suelo = 0.5 * cubo.tamano
-            if cubo.posicion.y < suelo:
-                impacto = -cubo.velocidad.y
-                cubo.posicion.y = suelo
-                cubo.velocidad.y = -cubo.velocidad.y * RESTITUCION
-                if impacto > UMBRAL_IMPACTO:
-                    generar_particulas(cubo.posicion, particulas)
-
-        for particula in particulas:
-            particula.velocidad.y += gravedad.y * dt
-            particula.posicion.x += particula.velocidad.x * dt
-            particula.posicion.y += particula.velocidad.y * dt
-            particula.posicion.z += particula.velocidad.z * dt
-            if particula.posicion.y < RADIO_PARTICULA:
-                particula.posicion.y = RADIO_PARTICULA
-                particula.velocidad.y = -particula.velocidad.y * 0.4
-            particula.vida -= dt
-        particulas = [p for p in particulas if p.vida > 0.0]
+        fragmentos = actualizar_fragmentos(fragmentos, dt)
 
         rl.update_camera(camara, rl.CAMERA_FREE)
 
+        camara_dibujo = camara
+        if shake > 0.0:
+            intensidad = SHAKE_MAGNITUD * (shake / SHAKE_DURACION)
+            camara_dibujo = rl.Camera3D(
+                camara.position,
+                rl.Vector3(
+                    camara.target.x + random.uniform(-1.0, 1.0) * intensidad,
+                    camara.target.y + random.uniform(-1.0, 1.0) * intensidad,
+                    camara.target.z + random.uniform(-1.0, 1.0) * intensidad,
+                ),
+                camara.up,
+                camara.fovy,
+                camara.projection,
+            )
+            shake -= dt
+            if shake < 0.0:
+                shake = 0.0
+
         rl.begin_drawing()
         rl.clear_background(rl.RAYWHITE)
-        rl.begin_mode_3d(camara)
+        rl.begin_mode_3d(camara_dibujo)
         rl.draw_grid(20, 1.0)
         for cubo in cubos:
-            rapidez = math.sqrt(
-                cubo.velocidad.x * cubo.velocidad.x
-                + cubo.velocidad.y * cubo.velocidad.y
-                + cubo.velocidad.z * cubo.velocidad.z
-            )
-            mezcla = max(0.0, min(1.0, rapidez / VELOCIDAD_COLOR))
-            color = rl.color_lerp(COLOR_LENTO, COLOR_RAPIDO, mezcla)
-            cubo.color = color
+            color = cubo.color
+            if cubo.flash > 0.0:
+                color = rl.color_lerp(color, rl.WHITE, min(1.0, cubo.flash / FLASH_DURACION))
             rl.draw_cube(cubo.posicion, cubo.tamano, cubo.tamano, cubo.tamano, color)
             rl.draw_cube_wires(cubo.posicion, cubo.tamano, cubo.tamano, cubo.tamano, rl.fade(color, 0.5))
-        for particula in particulas:
-            alfa = max(0.0, min(1.0, particula.vida / particula.vida_inicial))
-            rl.draw_sphere(particula.posicion, RADIO_PARTICULA, rl.fade(COLOR_PARTICULA, alfa))
+        for fragmento in fragmentos:
+            alfa = max(0.0, min(1.0, fragmento.vida / VIDA_FRAGMENTO))
+            rl.draw_cube(fragmento.posicion, 0.2, 0.2, 0.2, rl.fade(fragmento.color, alfa))
         if hay_mano and objetivo is not None:
             rl.draw_sphere(objetivo, 0.2, rl.BLUE)
         rl.end_mode_3d()
-        rl.draw_fps(10, 10)
-        rl.draw_text(f"Gesto: {gesto_efectivo}", 10, 40, 20, rl.DARKGRAY)
-        rl.draw_text(f"Crudo: {gesto_crudo}", 10, 70, 20, rl.DARKGRAY)
-        rl.draw_text(f"Cubos: {len(cubos)}  Particulas: {len(particulas)}", 10, 160, 20, rl.DARKGRAY)
-        rl.draw_text(f"Correcciones: {len(correcciones)}", 10, 190, 20, rl.DARKGRAY)
-        diag = tracker.diagnostico_actual()
-        if diag:
-            rl.draw_text(f"pulgar-indice {diag['pulgar_indice']}  (pinza < {UMBRAL_PELLIZCO})", 10, 100, 20, rl.DARKGRAY)
-            rl.draw_text(
-                f"medio {diag['medio']}  anular {diag['anular']}  menique {diag['menique']}  (ext > {UMBRAL_EXTENDIDO})",
-                10, 130, 20, rl.DARKGRAY,
-            )
+
+        if estado_juego == ESTADO_INICIO:
+            dibujar_centrado("ARCADE DE MANOS", 150, 60, rl.DARKBLUE)
+            dibujar_centrado("puno = explotar", 280, 24, rl.DARKGRAY)
+            dibujar_centrado("mano abierta = agarrar", 320, 24, rl.DARKGRAY)
+            dibujar_centrado("pinza para empezar", 380, 24, rl.MAROON)
+
+        elif estado_juego == ESTADO_JUGANDO and mostrar_hud:
+            rl.draw_fps(10, 10)
+            rl.draw_text(f"Oleada: {oleada}", 10, 40, 20, rl.DARKGRAY)
+            rl.draw_text(f"Tiempo: {max(0.0, temporizador_oleada):.1f}s", 10, 70, 20, rl.DARKGRAY)
+            rl.draw_text(f"Score: {score}", 10, 100, 20, rl.DARKGRAY)
+            rl.draw_text(f"Cubos: {len(cubos)}", 10, 130, 20, rl.DARKGRAY)
+            rl.draw_text(f"Gesto: {gesto_efectivo}", 10, 160, 20, rl.DARKGRAY)
+            rl.draw_text(f"Correcciones: {len(correcciones)}", 10, 190, 20, rl.DARKGRAY)
+            combo_activo = combo_multiplicador > 1 and (ahora - tiempo_ultimo_combo) <= VENTANA_COMBO
+            if combo_activo:
+                rl.draw_text(f"Combo x{combo_multiplicador}", 10, 220, 30, rl.ORANGE)
+
+        elif estado_juego == ESTADO_GAME_OVER:
+            dibujar_centrado("GAME OVER", 150, 60, rl.RED)
+            dibujar_centrado(f"Score final: {score}", 250, 30, rl.DARKBLUE)
+            dibujar_centrado(f"Oleada alcanzada: {oleada}", 300, 24, rl.DARKGRAY)
+            dibujar_centrado("pinza para reintentar", 380, 24, rl.MAROON)
+
         rl.end_drawing()
 
     tracker.cerrar()
@@ -325,6 +576,13 @@ def main():
             X_total = X_nuevas
             y_total = y_nuevas
         np.savez(RUTA_CORRECCIONES, X=X_total, y=y_total)
+
+    if sonido_explosion is not None:
+        rl.unload_sound(sonido_explosion)
+    if sonido_pop is not None:
+        rl.unload_sound(sonido_pop)
+    if audio_inicializado:
+        rl.close_audio_device()
 
     rl.close_window()
 
