@@ -1,6 +1,8 @@
 import math
+import os
 
 import cv2
+import joblib
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -11,6 +13,7 @@ from contratos import EstadoMano
 
 UMBRAL_EXTENDIDO = 0.15
 UMBRAL_PELLIZCO = 0.35
+UMBRAL_CONFIANZA = 0.6
 
 CONEXIONES = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -20,6 +23,21 @@ CONEXIONES = [
     (13, 17), (17, 18), (18, 19), (19, 20),
     (0, 17),
 ]
+
+RUTA_MODELO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gestos_mlp.joblib")
+
+
+def _cargar_modelo(ruta=RUTA_MODELO):
+    try:
+        modelo = joblib.load(ruta)
+    except Exception:
+        return None
+    if not isinstance(modelo, dict) or "pipeline" not in modelo or "clases" not in modelo:
+        return None
+    return modelo
+
+
+modelo_gestos = _cargar_modelo()
 
 
 def iniciar_captura(camara=0):
@@ -76,7 +94,7 @@ def _dedo_extendido(landmarks, punta_idx, base_idx, escala):
     return _ratio_extension(landmarks, punta_idx, base_idx, escala) > UMBRAL_EXTENDIDO
 
 
-def clasificar_gesto(landmarks):
+def _clasificar_gesto_heuristica(landmarks):
     escala = _tamano_mano(landmarks)
     if escala == 0:
         return "indefinido"
@@ -98,6 +116,34 @@ def clasificar_gesto(landmarks):
         return "indefinido"
 
 
+def _clasificar_gesto_mlp(vector):
+    pipeline = modelo_gestos["pipeline"]
+    clases = modelo_gestos["clases"]
+    prediccion = pipeline.predict([vector])[0]
+    if isinstance(prediccion, str):
+        gesto = prediccion
+    else:
+        gesto = clases[int(prediccion)]
+    try:
+        confianza = float(max(pipeline.predict_proba([vector])[0]))
+    except Exception:
+        confianza = 1.0
+    if confianza < UMBRAL_CONFIANZA:
+        return "indefinido"
+    return gesto
+
+
+def clasificar_gesto(landmarks):
+    if landmarks is None:
+        return "indefinido"
+    if modelo_gestos is not None:
+        vector = normalizar_landmarks(landmarks)
+        if vector is None:
+            return "indefinido"
+        return _clasificar_gesto_mlp(vector)
+    return _clasificar_gesto_heuristica(landmarks)
+
+
 def diagnostico_gesto(landmarks):
     escala = _tamano_mano(landmarks)
     if escala == 0:
@@ -108,6 +154,20 @@ def diagnostico_gesto(landmarks):
         "anular": round(_ratio_extension(landmarks, 16, 13, escala), 3),
         "menique": round(_ratio_extension(landmarks, 20, 17, escala), 3),
     }
+
+
+def normalizar_landmarks(landmarks):
+    escala = _tamano_mano(landmarks)
+    if escala == 0:
+        return None
+    ref_x = landmarks[0].x
+    ref_y = landmarks[0].y
+    vector = []
+    for p in landmarks:
+        vector.append((p.x - ref_x) / escala)
+        vector.append((p.y - ref_y) / escala)
+        vector.append(p.z / escala)
+    return vector
 
 
 def landmarks_a_estado(landmarks):

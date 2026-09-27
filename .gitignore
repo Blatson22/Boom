@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 mi_entorno/
+dataset.npz
+gestos_mlp.joblib
