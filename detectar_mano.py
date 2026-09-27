@@ -46,6 +46,7 @@ def iniciar_captura(camara=0):
         return None
     captura.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     captura.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    captura.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return captura
 
 
@@ -63,6 +64,7 @@ def obtener_landmarks(captura, detector):
     ret, frame = captura.read()
     if not ret:
         return None
+    frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     imagen = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     resultado = detector.detect_for_video(imagen, int(captura.get(cv2.CAP_PROP_POS_MSEC)))
@@ -119,18 +121,15 @@ def _clasificar_gesto_heuristica(landmarks):
 def _clasificar_gesto_mlp(vector):
     pipeline = modelo_gestos["pipeline"]
     clases = modelo_gestos["clases"]
-    prediccion = pipeline.predict([vector])[0]
-    if isinstance(prediccion, str):
-        gesto = prediccion
-    else:
-        gesto = clases[int(prediccion)]
     try:
-        confianza = float(max(pipeline.predict_proba([vector])[0]))
+        probabilidades = pipeline.predict_proba([vector])[0]
     except Exception:
-        confianza = 1.0
+        return "indefinido"
+    indice = int(probabilidades.argmax())
+    confianza = float(probabilidades[indice])
     if confianza < UMBRAL_CONFIANZA:
         return "indefinido"
-    return gesto
+    return clases[indice]
 
 
 def clasificar_gesto(landmarks):

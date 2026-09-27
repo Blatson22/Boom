@@ -1,5 +1,5 @@
 ---
-description: Especialista en el loop de raylib y física del cubo. Usar para cambios en el bucle principal de simulacion_3d.py, integración de física y comportamiento del cubo según gestos/posición.
+description: Especialista en el loop de raylib, física de objetos (uno o varios) y su integración con EstadoMano y experiencia-juego.
 mode: subagent
 ---
 

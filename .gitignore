@@ -2,4 +2,5 @@ __pycache__/
 *.pyc
 mi_entorno/
 dataset.npz
+correcciones.npz
 gestos_mlp.joblib
