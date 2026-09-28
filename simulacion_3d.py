@@ -11,6 +11,7 @@ import pyray as rl
 
 from contratos import EstadoMano
 from detectar_mano import (
+    CONEXIONES,
     crear_detector,
     diagnostico_gesto,
     iniciar_captura,
@@ -25,12 +26,16 @@ FPS_DETECCION = 30
 
 RUTA_CORRECCIONES = "correcciones.npz"
 
-AREA_X_MIN = -4.0
-AREA_X_MAX = 4.0
+ANCHO_VIDEO = 1080
+ALTO_VIDEO = 1920
+ESCALA_VENTANA = 0.5
+
+AREA_X_MIN = -2.5
+AREA_X_MAX = 2.5
 AREA_Y_MIN = 0.8
-AREA_Y_MAX = 3.2
-AREA_Z_MIN = -4.0
-AREA_Z_MAX = 4.0
+AREA_Y_MAX = 8.5
+AREA_Z_MIN = -1.0
+AREA_Z_MAX = 1.0
 VELOCIDAD_CUBO_MIN = 1.0
 VELOCIDAD_CUBO_MAX = 2.2
 VELOCIDAD_RAPIDO_MIN = 1.8
@@ -41,11 +46,23 @@ UMBRAL_WAYPOINT = 0.3
 
 COLOR_NORMAL = rl.SKYBLUE
 COLOR_RAPIDO = rl.YELLOW
-COLOR_TANQUE = rl.BLUE
+COLOR_TANQUE = rl.MAGENTA
+
+COLOR_FONDO = rl.Color(5, 6, 14, 255)
+COLOR_NEON_LINEA = rl.color_from_hsv(140, 0.9, 1.0)
+COLOR_HUESO_LINEA = rl.Color(225, 247, 255, 255)
+COLOR_HUESO_HALO = rl.Color(130, 215, 255, 255)
+COLOR_HUESO_PUNTO = rl.WHITE
+COLOR_ESFERA_MANO = rl.color_from_hsv(30, 0.9, 1.0)
 MAX_CUBOS = 12
+DISTANCIA_MIN_SPAWN = 1.0
+INTENTOS_SPAWN = 8
+RADIO_REPULSION = 1.2
+FUERZA_REPULSION = 0.4
+FACTOR_TAMANO_MIN = 0.7
 MAX_FRAGMENTOS = 300
-RADIO_EXPLOSION = 3.0
-RADIO_CADENA = 2.5
+RADIO_EXPLOSION = 2.0
+RADIO_CADENA = 1.5
 SHAKE_DURACION = 0.35
 SHAKE_MAGNITUD = 0.4
 VOLUMEN_EXPLOSION = 0.8
@@ -92,6 +109,53 @@ def objetivo_aleatorio():
         random.uniform(AREA_Y_MIN, AREA_Y_MAX),
         random.uniform(AREA_Z_MIN, AREA_Z_MAX),
     )
+
+
+def factor_tamano_por_cantidad(cantidad):
+    if cantidad <= 5:
+        return 1.0
+    return max(FACTOR_TAMANO_MIN, 1.0 - 0.05 * (cantidad - 5))
+
+
+def posicion_spawn_libre(existentes):
+    candidata = None
+    for _ in range(INTENTOS_SPAWN):
+        posicion = rl.Vector3(
+            random.uniform(AREA_X_MIN, AREA_X_MAX),
+            random.uniform(AREA_Y_MIN, AREA_Y_MAX),
+            random.uniform(AREA_Z_MIN, AREA_Z_MAX),
+        )
+        candidata = posicion
+        if all(distancia_v3(posicion, c.posicion) >= DISTANCIA_MIN_SPAWN for c in existentes):
+            return posicion
+    return candidata
+
+
+def aplicar_repulsion(cubos, agarrados):
+    for i in range(len(cubos)):
+        a = cubos[i]
+        if a in agarrados:
+            continue
+        for j in range(i + 1, len(cubos)):
+            b = cubos[j]
+            if b in agarrados:
+                continue
+            dx = a.posicion.x - b.posicion.x
+            dy = a.posicion.y - b.posicion.y
+            dz = a.posicion.z - b.posicion.z
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist >= RADIO_REPULSION or dist <= 0.0001:
+                continue
+            solapamiento = (RADIO_REPULSION - dist) * FUERZA_REPULSION
+            nx = dx / dist
+            ny = dy / dist
+            nz = dz / dist
+            a.posicion.x += nx * solapamiento
+            a.posicion.y += ny * solapamiento
+            a.posicion.z += nz * solapamiento
+            b.posicion.x -= nx * solapamiento
+            b.posicion.y -= ny * solapamiento
+            b.posicion.z -= nz * solapamiento
 
 
 def puntuacion_por_tipo(tipo):
@@ -184,7 +248,7 @@ def actualizar_fragmentos(fragmentos, dt):
     return [f for f in fragmentos if f.vida > 0.0 and f.posicion.y > -1.0]
 
 
-def crear_cubo_de_tipo(tipo, oleada):
+def crear_cubo_de_tipo(tipo, oleada, cubos_existentes=None):
     escala = escala_velocidad_oleada(oleada)
     if tipo == "rapido":
         tamano = TAMANO_RAPIDO
@@ -201,18 +265,14 @@ def crear_cubo_de_tipo(tipo, oleada):
         color = COLOR_NORMAL
         velocidad_max = random.uniform(VELOCIDAD_CUBO_MIN, VELOCIDAD_CUBO_MAX) * escala
         vida = 1
-    posicion = rl.Vector3(
-        random.uniform(AREA_X_MIN, AREA_X_MAX),
-        random.uniform(1.0, 5.0) + 0.5 * tamano,
-        random.uniform(AREA_Z_MIN, AREA_Z_MAX),
-    )
+    posicion = posicion_spawn_libre(cubos_existentes if cubos_existentes is not None else [])
     return Cubo(posicion, tamano, color, tipo, vida, velocidad_max)
 
 
 def crear_oleada(oleada):
     cubos = []
     for _ in range(numero_cubos_oleada(oleada)):
-        cubos.append(crear_cubo_de_tipo(elegir_tipo_cubo(oleada), oleada))
+        cubos.append(crear_cubo_de_tipo(elegir_tipo_cubo(oleada), oleada, cubos))
     return cubos
 
 
@@ -258,6 +318,22 @@ def dibujar_centrado(texto, y, tamano, color):
     rl.draw_text(texto, x, y, tamano, color)
 
 
+def dibujar_esqueleto_mano(landmarks):
+    if landmarks is None:
+        return
+    ancho = rl.get_screen_width()
+    alto = rl.get_screen_height()
+    puntos = [rl.Vector2(p.x * ancho, p.y * alto) for p in landmarks]
+    for a, b in CONEXIONES:
+        inicio = puntos[a]
+        fin = puntos[b]
+        rl.draw_line_ex(inicio, fin, 14.0, rl.fade(COLOR_HUESO_HALO, 0.18))
+        rl.draw_line_ex(inicio, fin, 5.0, COLOR_HUESO_LINEA)
+    for punto in puntos:
+        rl.draw_circle_v(punto, 11.0, rl.fade(COLOR_HUESO_HALO, 0.18))
+        rl.draw_circle_v(punto, 4.5, COLOR_HUESO_PUNTO)
+
+
 class HandTracker:
     def __init__(self):
         self.captura = iniciar_captura()
@@ -266,6 +342,7 @@ class HandTracker:
         self._estado = None
         self._diag = None
         self._vector = None
+        self._landmarks = None
         self._activo = self.captura is not None
         self._hilo = None
         if self._activo:
@@ -284,6 +361,7 @@ class HandTracker:
                 self._estado = nuevo
                 self._diag = diag
                 self._vector = vector
+                self._landmarks = landmarks
             restante = periodo - (time.monotonic() - inicio)
             if restante > 0:
                 time.sleep(restante)
@@ -300,6 +378,10 @@ class HandTracker:
         with self._lock:
             return self._vector
 
+    def landmarks_actual(self):
+        with self._lock:
+            return self._landmarks
+
     def cerrar(self):
         self._activo = False
         if self._hilo is not None:
@@ -310,7 +392,7 @@ class HandTracker:
 
 
 def main():
-    rl.init_window(800, 600, "Simulacion 3D")
+    rl.init_window(int(ANCHO_VIDEO * ESCALA_VENTANA), int(ALTO_VIDEO * ESCALA_VENTANA), "Simulacion 3D")
     rl.set_target_fps(60)
 
     audio_inicializado = False
@@ -329,8 +411,8 @@ def main():
         sonido_pop = None
 
     camara = rl.Camera3D(
-        rl.Vector3(0.0, 6.0, 12.0),
-        rl.Vector3(0.0, 2.0, 0.0),
+        rl.Vector3(0.0, 4.0, 12.0),
+        rl.Vector3(0.0, 4.0, 0.0),
         rl.Vector3(0.0, 1.0, 0.0),
         45.0,
         rl.CAMERA_PERSPECTIVE,
@@ -394,7 +476,7 @@ def main():
         gesto_nuevo = gesto_efectivo != gesto_efectivo_previo
 
         if estado_juego == ESTADO_INICIO:
-            if gesto_efectivo == "pinza" and gesto_nuevo:
+            if rl.is_key_pressed(rl.KEY_SPACE):
                 oleada = 1
                 score = 0
                 combo_multiplicador = 1
@@ -444,7 +526,7 @@ def main():
                                     combo_multiplicador = 1
 
         elif estado_juego == ESTADO_GAME_OVER:
-            if gesto_efectivo == "pinza" and gesto_nuevo:
+            if rl.is_key_pressed(rl.KEY_SPACE):
                 oleada = 1
                 score = 0
                 combo_multiplicador = 1
@@ -458,9 +540,6 @@ def main():
         gesto_efectivo_previo = gesto_efectivo
 
         objetivo = objetivo_estable if (hay_mano and objetivo_estable is not None) else None
-        cubo_cercano = None
-        if estado_juego == ESTADO_JUGANDO and objetivo is not None and cubos:
-            cubo_cercano = min(cubos, key=lambda c: distancia_v3(c.posicion, objetivo))
 
         for cubo in cubos:
             if cubo.flash > 0.0:
@@ -468,12 +547,6 @@ def main():
                 if cubo.flash < 0.0:
                     cubo.flash = 0.0
             if estado_juego != ESTADO_JUGANDO:
-                continue
-
-            agarrado = hay_mano and objetivo is not None and cubo is cubo_cercano and gesto_efectivo == "mano_abierta"
-            if agarrado:
-                cubo.posicion = rl.Vector3(objetivo.x, objetivo.y, objetivo.z)
-                cubo.velocidad = rl.Vector3(0.0, 0.0, 0.0)
                 continue
 
             dx = cubo.objetivo_movimiento.x - cubo.posicion.x
@@ -495,6 +568,13 @@ def main():
             cubo.posicion.x = max(AREA_X_MIN, min(AREA_X_MAX, cubo.posicion.x))
             cubo.posicion.y = max(AREA_Y_MIN, min(AREA_Y_MAX, cubo.posicion.y))
             cubo.posicion.z = max(AREA_Z_MIN, min(AREA_Z_MAX, cubo.posicion.z))
+
+        if estado_juego == ESTADO_JUGANDO:
+            aplicar_repulsion(cubos, set())
+            for cubo in cubos:
+                cubo.posicion.x = max(AREA_X_MIN, min(AREA_X_MAX, cubo.posicion.x))
+                cubo.posicion.y = max(AREA_Y_MIN, min(AREA_Y_MAX, cubo.posicion.y))
+                cubo.posicion.z = max(AREA_Z_MIN, min(AREA_Z_MAX, cubo.posicion.z))
 
         fragmentos = actualizar_fragmentos(fragmentos, dt)
 
@@ -519,45 +599,48 @@ def main():
                 shake = 0.0
 
         rl.begin_drawing()
-        rl.clear_background(rl.RAYWHITE)
+        rl.clear_background(COLOR_FONDO)
         rl.begin_mode_3d(camara_dibujo)
         rl.draw_grid(20, 1.0)
+        factor_tamano = factor_tamano_por_cantidad(len(cubos))
         for cubo in cubos:
             color = cubo.color
             if cubo.flash > 0.0:
                 color = rl.color_lerp(color, rl.WHITE, min(1.0, cubo.flash / FLASH_DURACION))
-            rl.draw_cube(cubo.posicion, cubo.tamano, cubo.tamano, cubo.tamano, color)
-            rl.draw_cube_wires(cubo.posicion, cubo.tamano, cubo.tamano, cubo.tamano, rl.fade(color, 0.5))
+            tam = cubo.tamano * factor_tamano
+            rl.draw_cube(cubo.posicion, tam, tam, tam, color)
+            rl.draw_cube_wires(cubo.posicion, tam, tam, tam, rl.color_lerp(color, rl.WHITE, 0.6))
         for fragmento in fragmentos:
             alfa = max(0.0, min(1.0, fragmento.vida / VIDA_FRAGMENTO))
             rl.draw_cube(fragmento.posicion, 0.2, 0.2, 0.2, rl.fade(fragmento.color, alfa))
         if hay_mano and objetivo is not None:
-            rl.draw_sphere(objetivo, 0.2, rl.BLUE)
+            rl.draw_sphere(objetivo, 0.2, COLOR_ESFERA_MANO)
         rl.end_mode_3d()
 
+        dibujar_esqueleto_mano(tracker.landmarks_actual())
+
         if estado_juego == ESTADO_INICIO:
-            dibujar_centrado("ARCADE DE MANOS", 150, 60, rl.DARKBLUE)
-            dibujar_centrado("puno = explotar", 280, 24, rl.DARKGRAY)
-            dibujar_centrado("mano abierta = agarrar", 320, 24, rl.DARKGRAY)
-            dibujar_centrado("pinza para empezar", 380, 24, rl.MAROON)
+            dibujar_centrado("ARCADE DE MANOS", 150, 60, COLOR_NEON_LINEA)
+            dibujar_centrado("puno = explotar", 280, 24, rl.LIGHTGRAY)
+            dibujar_centrado("espacio para empezar", 380, 24, rl.ORANGE)
 
         elif estado_juego == ESTADO_JUGANDO and mostrar_hud:
             rl.draw_fps(10, 10)
-            rl.draw_text(f"Oleada: {oleada}", 10, 40, 20, rl.DARKGRAY)
-            rl.draw_text(f"Tiempo: {max(0.0, temporizador_oleada):.1f}s", 10, 70, 20, rl.DARKGRAY)
-            rl.draw_text(f"Score: {score}", 10, 100, 20, rl.DARKGRAY)
-            rl.draw_text(f"Cubos: {len(cubos)}", 10, 130, 20, rl.DARKGRAY)
-            rl.draw_text(f"Gesto: {gesto_efectivo}", 10, 160, 20, rl.DARKGRAY)
-            rl.draw_text(f"Correcciones: {len(correcciones)}", 10, 190, 20, rl.DARKGRAY)
+            rl.draw_text(f"Oleada: {oleada}", 10, 40, 20, rl.LIGHTGRAY)
+            rl.draw_text(f"Tiempo: {max(0.0, temporizador_oleada):.1f}s", 10, 70, 20, rl.LIGHTGRAY)
+            rl.draw_text(f"Score: {score}", 10, 100, 20, rl.LIGHTGRAY)
+            rl.draw_text(f"Cubos: {len(cubos)}", 10, 130, 20, rl.LIGHTGRAY)
+            rl.draw_text(f"Gesto: {gesto_efectivo}", 10, 160, 20, rl.LIGHTGRAY)
+            rl.draw_text(f"Correcciones: {len(correcciones)}", 10, 190, 20, rl.LIGHTGRAY)
             combo_activo = combo_multiplicador > 1 and (ahora - tiempo_ultimo_combo) <= VENTANA_COMBO
             if combo_activo:
                 rl.draw_text(f"Combo x{combo_multiplicador}", 10, 220, 30, rl.ORANGE)
 
         elif estado_juego == ESTADO_GAME_OVER:
             dibujar_centrado("GAME OVER", 150, 60, rl.RED)
-            dibujar_centrado(f"Score final: {score}", 250, 30, rl.DARKBLUE)
-            dibujar_centrado(f"Oleada alcanzada: {oleada}", 300, 24, rl.DARKGRAY)
-            dibujar_centrado("pinza para reintentar", 380, 24, rl.MAROON)
+            dibujar_centrado(f"Score final: {score}", 250, 30, rl.LIGHTGRAY)
+            dibujar_centrado(f"Oleada alcanzada: {oleada}", 300, 24, rl.LIGHTGRAY)
+            dibujar_centrado("espacio para reintentar", 380, 24, rl.ORANGE)
 
         rl.end_drawing()
 

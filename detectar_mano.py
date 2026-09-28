@@ -14,6 +14,12 @@ from contratos import EstadoMano
 UMBRAL_EXTENDIDO = 0.15
 UMBRAL_PELLIZCO = 0.35
 UMBRAL_CONFIANZA = 0.6
+ZONA_MANO_X_MIN = 0.2
+ZONA_MANO_X_MAX = 0.8
+ZONA_MANO_Y_MIN = 0.15
+ZONA_MANO_Y_MAX = 0.85
+ESCENA_ANCHO = 5.0
+ESCENA_ALTO = 8.0
 
 CONEXIONES = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -172,7 +178,9 @@ def normalizar_landmarks(landmarks):
 
 def landmarks_a_estado(landmarks):
     x, y = centro_palma(landmarks)
-    posicion = rl.Vector3((x - 0.5) * 8.0, (1.0 - y) * 5.0 + 0.5, 0.0)
+    xn = min(max((x - ZONA_MANO_X_MIN) / (ZONA_MANO_X_MAX - ZONA_MANO_X_MIN), 0.0), 1.0)
+    yn = min(max((y - ZONA_MANO_Y_MIN) / (ZONA_MANO_Y_MAX - ZONA_MANO_Y_MIN), 0.0), 1.0)
+    posicion = rl.Vector3((xn - 0.5) * ESCENA_ANCHO, (1.0 - yn) * ESCENA_ALTO + 0.5, 0.0)
     gesto = clasificar_gesto(landmarks)
     return EstadoMano(posicion=posicion, gesto=gesto)
 
